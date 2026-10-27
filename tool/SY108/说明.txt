@@ -1,0 +1,8 @@
+1. 驱动安装
+SPRDriver > DriversForWin10 > DriverSetup.exe
+
+2.刷机
+双击install.bat 记得短接进入u2s 模式
+
+3.接口连接始终失败
+打开zadig-2.9.exe  把驱动换成 libusb-win32 然后再次尝试连接刷机，刷机完成后由于是 libusb-win32 驱动可能无法使用，在设备管理器里面卸载，如果有删除驱动记得勾选，然后再次插拔就会变成初始那种驱动。
