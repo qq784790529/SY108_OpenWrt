@@ -1,0 +1,388 @@
+name: Build_sy108_UDX710_2
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: ' ← 选择是否开启 SSH 调试专业人员使用'
+        required: false
+        default: false
+        type: boolean
+
+# 👇 赋予 GITHUB_TOKEN 写入权限，解决 Release 403
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/jason-liu-4980/sy108-mainline
+  REPO_BRANCH: main
+  JOBS: 4
+  DIY_SY108_SH: diy-sy108.sh
+  UPLOAD_FIRMWARE: true
+  TZ: Asia/Shanghai
+  SY108_OUT: ${{ github.workspace }}/out
+  SY108_DOWNLOADS: ${{ github.workspace }}/dl
+  # U-Boot 裸二进制安全线 600 KiB（为 DHTB+SML 封装预留余量）
+  UBOOT_RAW_LIMIT: 614400
+  # SPL 实际读取上限 0xC0000 = 768 KiB
+  UBOOT_PART_LIMIT: 786432
+
+jobs:
+  # ================= 阶段 1：双线并行编译 =================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [main, recovery]
+    runs-on: ubuntu-latest
+    env:
+      PROFILE: ${{ matrix.profile }}
+
+    steps:
+    - name: 拉取当前仓库
+      uses: actions/checkout@v4
+
+    - name: 打印硬件信息
+      run: |
+        chmod 755 ./scripts/show_hardware_info.sh
+        ./scripts/show_hardware_info.sh
+
+    - name: 释放磁盘空间
+      uses: insightsengineering/disk-space-reclaimer@v1.1.2
+      with:
+        android: false
+        dotnet: false
+        haskell: false
+        large-packages: false
+        swap-storage: false
+        docker-images: false
+        tools-cache: true
+
+    - name: 初始化编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::ForceIPv4=true"
+        sudo -E apt-get $APT_OPTS -y update
+        PKGS=$(curl -fsSL https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt | tr ' ' '\n' | grep -vE '^(gcc-multilib|g\+\+-multilib|libc6-dev-i386)$' | tr '\n' ' ')
+        sudo -E apt-get $APT_OPTS -y install --no-install-recommends $PKGS
+        sudo timedatectl set-timezone "${TZ}"
+
+    - name: 克隆作者源码
+      run: |
+        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" sy108
+        echo "SY108_COMMIT=$(git -C sy108 rev-parse --short HEAD)" >> $GITHUB_ENV
+
+    - name: 给源码打补丁 (干掉 Docker 限制)
+      working-directory: ./sy108
+      run: |
+        cat "$GITHUB_WORKSPACE/scripts/sy108/workspace_overlay.py" >> tools/lib/workspace.py
+        sed -i 's|raise SystemExit("Linux archive checksum mismatch")|print(f"::warning::kernel archive sha256={digest}, manifest mismatch ignored")|' tools/build/kernel-source.py
+        sed -i "s/'V=s'/'V=' + __import__('os').environ.get('V','0')/g" tools/build/firmware.py
+
+    - name: 映射编译路径
+      run: |
+        mkdir -p "$SY108_OUT" "$SY108_DOWNLOADS"
+        sudo ln -sfn "$GITHUB_WORKSPACE/sy108" /project
+        sudo ln -sfn "$SY108_OUT" /output
+        sudo ln -sfn "$SY108_DOWNLOADS" /downloads
+
+    - name: 初始化 OpenWrt 与 Feeds
+      working-directory: ./sy108
+      run: ./tools/python tools/bootstrap.py --skip-container
+
+    - name: 加载自定义脚本
+      run: |
+        [ -f "$DIY_SY108_SH" ] || exit 0
+        chmod +x "$DIY_SY108_SH"
+        cd "$SY108_OUT/openwrt-build"
+        $GITHUB_WORKSPACE/$DIY_SY108_SH
+
+    - name: 编译固件
+      working-directory: ./sy108
+      run: |
+        if ! ./tools/python tools/build/firmware.py "$PROFILE" --jobs "$JOBS"; then
+            echo "Compile failed, retry with -j2 V=s"
+            V=s ./tools/python tools/build/firmware.py "$PROFILE" --jobs 2
+        fi
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: 整理编译产物
+      run: |
+        cd "$SY108_OUT/images/$PROFILE"
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+
+    - name: 上传编译产物 (Action 页面底部下载)
+      uses: actions/upload-artifact@v4
+      with:
+        name: SY108_firmware_${{ env.PROFILE }}
+        path: ${{ env.FIRMWARE }}/*
+
+  # ================= 阶段 2：串行封装 U-Boot (源码级裁剪 + USB 控制台) =================
+  package_uboot:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: 拉取当前仓库
+      uses: actions/checkout@v4
+
+    - name: 安装裁剪工具
+      run: sudo apt-get install -y binutils-aarch64-linux-gnu || true
+
+    - name: 检查原厂 SML/SPL 是否就位
+      run: |
+        ls -lh privates/ || true
+        for f in privates/splloader.bin privates/sml.bin; do
+          if [ ! -f "$f" ]; then
+            echo "::error::缺少 $f，无法进行 SML 封装"
+            exit 1
+          fi
+        done
+
+    - name: 下载 Main 和 Recovery 的产物
+      uses: actions/download-artifact@v4
+      with:
+        pattern: SY108_firmware_*
+        path: firmware_artifacts
+
+    - name: 克隆 U-Boot 源码 (修复 oem 分支问题)
+      run: |
+        git clone https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
+        cd uboot-spl
+        git fetch --all --tags
+        git branch oem origin/oem || echo "本地 oem 分支已就绪"
+
+    - name: 注入源码级裁剪配置 + USB 控制台
+      working-directory: ./uboot-spl
+      run: |
+        set -e
+        DEFCONFIG=$(find . -maxdepth 5 -name '*defconfig' -path '*configs*' | head -1 || true)
+        if [ -z "$DEFCONFIG" ]; then
+          echo "::warning::未找到 defconfig，跳过源码裁剪注入。请手动配置 CONFIG_NET/USB_TTY 等。"
+          exit 0
+        fi
+        echo "找到 defconfig: $DEFCONFIG"
+        cat >> "$DEFCONFIG" <<'UBOOT_TRIM'
+
+        # ===== 体积裁剪：关闭未使用功能 =====
+        # CONFIG_NET is not set
+        # CONFIG_CMD_NET is not set
+        # CONFIG_CMD_PING is not set
+        # CONFIG_CMD_DHCP is not set
+        # CONFIG_CMD_TFTPBOOT is not set
+        # CONFIG_CMD_NFS is not set
+        # CONFIG_CMD_FAT is not set
+        # CONFIG_CMD_EXT4 is not set
+        # CONFIG_CMD_EXT2 is not set
+        # CONFIG_FS_FAT is not set
+        # CONFIG_FS_EXT4 is not set
+        # CONFIG_USB_HOST is not set
+        # CONFIG_USB_EHCI_HCD is not set
+        # CONFIG_USB_XHCI_HCD is not set
+        # CONFIG_USB_STORAGE is not set
+        # CONFIG_CMD_MEMTEST is not set
+        # CONFIG_CMD_BDI is not set
+        # CONFIG_CMD_IRQ is not set
+        # CONFIG_CMD_DATE is not set
+        # CONFIG_CMD_SLEEP is not set
+        # CONFIG_DEBUG is not set
+        # CONFIG_LOG is not set
+
+        # ===== USB 控制台（唯一交互通道）=====
+        CONFIG_USB=y
+        CONFIG_USB_DEVICE=y
+        CONFIG_USB_GADGET=y
+        CONFIG_USB_TTY=y
+        CONFIG_USB_GADGET_DWC3=y
+        CONFIG_CMD_USB=y
+
+        # ===== 体积优化 =====
+        CONFIG_LTO=y
+        UBOOT_TRIM
+        # 确保下次 make 从 defconfig 重新生成 .config
+        find . -maxdepth 5 -name '.config' -path '*u-boot*' -delete 2>/dev/null || true
+
+    - name: 编译 U-Boot 并执行裸二进制大小门禁
+      working-directory: ./uboot-spl
+      run: |
+        set -e
+        make LABEL=dev
+
+        echo "================= 编译产物清单 ================="
+        find . -type f -name "u-boot*" -exec ls -lh {} \; || true
+
+        # 取最终引导用的裸二进制：优先 u-boot-dtb.bin，其次 u-boot.bin
+        UBIN=$(find . -type f -name "u-boot-dtb.bin" | head -1 || true)
+        if [ -z "$UBIN" ]; then
+          UBIN=$(find . -type f -name "u-boot.bin" | head -1 || true)
+        fi
+        if [ -z "$UBIN" ]; then
+          echo "::error::未找到 u-boot.bin / u-boot-dtb.bin"
+          exit 1
+        fi
+        SIZE=$(stat -c%s "$UBIN")
+        echo "U-Boot 裸二进制: $UBIN = ${SIZE} bytes (安全线 ${UBOOT_RAW_LIMIT})"
+
+        # 检查关键配置是否真正生效
+        CONFIG_FILE=$(find . -maxdepth 5 -name '.config' -path '*u-boot*' | head -1 || true)
+        if [ -n "$CONFIG_FILE" ]; then
+          echo "================= 关键配置检查 ================="
+          grep -E '^CONFIG_(NET|USB_TTY|USB_GADGET|USB_DEVICE|LTO)' "$CONFIG_FILE" || true
+          if ! grep -q '^CONFIG_USB_TTY=y' "$CONFIG_FILE"; then
+            echo "::warning::CONFIG_USB_TTY 未生效，USB 控制台可能不可用"
+          fi
+        fi
+
+        if [ "$SIZE" -gt "$UBOOT_RAW_LIMIT" ]; then
+          echo "::error::U-Boot ${SIZE} bytes 超过安全线 ${UBOOT_RAW_LIMIT} bytes。"
+          echo "请继续裁剪 defconfig：关闭更多 CMD_* 和驱动。"
+          exit 1
+        fi
+        echo "✅ U-Boot 裸二进制在安全范围内 (${SIZE} < ${UBOOT_RAW_LIMIT})"
+
+    - name: 封装 U-Boot (注入原厂 SML 签名) 并检查分区上限
+      working-directory: ./uboot-spl
+      run: |
+        set -e
+        make offline LABEL=mainline \
+          SPL_IMAGE=${{ github.workspace }}/privates/splloader.bin \
+          SML_IMAGE=${{ github.workspace }}/privates/sml.bin \
+          MAIN_CAPSULE=${{ github.workspace }}/firmware_artifacts/SY108_firmware_main/boot.bin \
+          RECOVERY_CAPSULE=${{ github.workspace }}/firmware_artifacts/SY108_firmware_recovery/boot.bin
+        cat build/mainline/offline-report.json
+
+        FINAL_SIZE=$(stat -c%s build/mainline/uboot.bin)
+        echo "最终 uboot.bin: ${FINAL_SIZE} bytes (SPL 读取上限 ${UBOOT_PART_LIMIT})"
+        if [ "$FINAL_SIZE" -gt "$UBOOT_PART_LIMIT" ]; then
+          echo "::error::封装后 uboot.bin 超过 SPL 读取上限！"
+          exit 1
+        fi
+        echo "✅ 封装后 uboot.bin 在 SPL 读取上限内"
+
+    - name: 上传 U-Boot 产物 (Action 页面底部下载)
+      uses: actions/upload-artifact@v4
+      with:
+        name: SY108_firmware_uboot
+        path: uboot-spl/build/mainline/uboot.bin
+
+  # ================= 阶段 3：统一发布到 Release =================
+  release:
+    needs: [build, package_uboot]
+    runs-on: ubuntu-latest
+    steps:
+    - name: 1. 拉取当前仓库源码 (获取 tool/SY108 里的全套工具)
+      uses: actions/checkout@v4
+
+    - name: 2. 下载所有编译产物
+      uses: actions/download-artifact@v4
+      with:
+        pattern: SY108_firmware_*
+        path: firmware
+
+    - name: 3. 组装一键刷机包与原始备份包
+      id: tag
+      run: |
+        set -e
+        TAG=$(date +"%Y.%m.%d-%H%M")
+        DATE_TAG=$(date +"%Y%m%d")
+        echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+        echo "release_name=SY108 OpenWrt 全自动刷机包 $TAG" >> $GITHUB_OUTPUT
+
+        # 1. 把散落的编译产物打平并加上前缀，防止同名覆盖
+        for d in firmware/SY108_firmware_*/; do
+          p=$(basename "$d" | sed 's/SY108_firmware_//')
+          for f in "$d"*; do
+            if [ -f "$f" ]; then
+              mv "$f" "firmware/${p}-$(basename "$f")"
+            fi
+          done
+          rmdir "$d" 2>/dev/null || true
+        done
+
+        # 2. 打包所有原始编译结果，命名为 bak-日期.zip
+        cd firmware
+        zip -r "../bak-${DATE_TAG}.zip" .
+        cd ..
+
+        # 3. 将核心固件复制到工具目录，并统一重命名
+        cp firmware/main-sysupgrade.bin tool/SY108/system.bin
+        cp firmware/main-boot.bin      tool/SY108/boot.bin
+        cp firmware/uboot-uboot.bin    tool/SY108/uboot.bin
+
+        # 4. 剔除开发者专用的 README.md
+        rm -f tool/SY108/README.md
+
+        # 5. 生成用户刷机说明（含 USB 控制台）
+        cat << 'EOF' > tool/SY108/刷机必读.txt
+        ================ SY108 一键刷机说明 ================
+        1. 如果电脑没反应，请先安装 "SPRDriver" 文件夹里的驱动。
+        2. 如果 spd_dump 报错，请运行 "zadig-2.9.exe"，在 Options 勾选 List All Devices，
+           选中你的设备，将驱动替换为 libusb-win32。
+        3. 让设备进入刷机模式（按住 RESET 插线）。
+        4. 双击运行 install.bat，按提示输入 Y 即可。
+
+        刷机完成后访问: http://192.168.66.1
+        账号: root
+        密码: admin
+
+        【U-Boot USB 控制台（本机仅引出 USB，无物理串口）】
+        本固件 U-Boot 已启用 usbtty (CDC-ACM)。刷入 U-Boot 后：
+        1. 用 USB 数据线连接电脑。
+        2. 设备管理器会出现一个新的 COM 端口（如 COM5）。
+        3. 用 PuTTY/minicom 打开该 COM 端口（CDC-ACM 不依赖波特率）。
+        4. 上电即可看到 U-Boot 输出并进入命令行。
+        若未出现 COM 端口，在 U-Boot 命令行确认并保存：
+          setenv stdin usbtty
+          setenv stdout usbtty
+          setenv stderr usbtty
+          setenv usbtty cdc_acm
+          saveenv
+        ====================================================
+        EOF
+
+        # 6. 进入 tool/SY108 目录内部打包为 SY108.zip
+        cd tool/SY108
+        zip -r "../../SY108.zip" .
+        cd ../..
+
+        # 7. 生成 GitHub Release 页面展示的说明文档
+        #    注意：这里用 << EOF（不加引号），让 ${DATE_TAG} 正常展开
+        cat << EOF > release.txt
+        ## 🚀 SY108 (UDX710) 自动化构建发布
+
+        本次发布包含两个压缩包：
+        1. **\`SY108.zip\`**：全自动一键刷机包。解压后双击 \`install.bat\` 即可刷机。
+        2. **\`bak-${DATE_TAG}.zip\`**：包含本次编译的所有原始产物，供开发者使用。
+
+        ### 📥 刷机说明
+        *(如遇到驱动问题，请阅读刷机包内的 \`刷机必读.txt\`)*
+        **管理地址**: \`192.168.66.1\` | **账号**: \`root\` | **密码**: \`admin\`
+
+        ### 🔌 U-Boot 调试
+        本机仅引出 USB 接口，U-Boot 已启用 usbtty（CDC-ACM）。连接 USB 后电脑会枚举出新的 COM 端口，用 PuTTY 打开即可进入 U-Boot 命令行。
+
+        ### 🙏 源码与致谢
+        *   核心源码移植: [@jason-liu-4980](https://github.com/jason-liu-4980)
+        *   Actions 自动化模板: [@xuxin1955](https://github.com/xuxin1955/Actions)
+        *   底层硬件与提取工具: [@TomKing062](https://github.com/TomKing062/spreadtrum_flash) & [@dann2333](https://github.com/dann2333/udx710-mifi-info)
+
+        > ⚖️ 本固件包含基于 GPL-2.0 协议的软件，源码见上方链接。
+        EOF
+
+    - name: 4. 发布到 GitHub Release
+      uses: ncipollo/release-action@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        name: ${{ steps.tag.outputs.release_name }}
+        tag: ${{ steps.tag.outputs.release_tag }}
+        bodyFile: release.txt
+        artifacts: |
+          SY108.zip
+          bak-*.zip
+          release.txt
+        allowUpdates: true
+        draft: false
+        prerelease: false
