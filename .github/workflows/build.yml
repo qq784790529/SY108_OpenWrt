@@ -16,12 +16,12 @@ env:
   JOBS: 4
   DIY_SY108_SH: diy-sy108.sh
   UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
   SY108_OUT: ${{ github.workspace }}/out
   SY108_DOWNLOADS: ${{ github.workspace }}/dl
 
 jobs:
+  # ================= 阶段 1：双线并行编译 =================
   build:
     strategy:
       fail-fast: false
@@ -32,15 +32,15 @@ jobs:
       PROFILE: ${{ matrix.profile }}
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+    - name: 拉取当前仓库
+      uses: actions/checkout@v4
 
-    - name: Show hardware info
+    - name: 打印硬件信息
       run: |
         chmod 755 ./scripts/show_hardware_info.sh
         ./scripts/show_hardware_info.sh
 
-    - name: Free Disk Space (Ubuntu)
+    - name: 释放磁盘空间
       uses: insightsengineering/disk-space-reclaimer@v1.1.2
       with:
         android: false
@@ -51,50 +51,49 @@ jobs:
         docker-images: false
         tools-cache: true
 
-    - name: Initialization environment
-      id: init
-      timeout-minutes: 25
+    - name: 初始化编译环境
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::ForceIPv4=true"
         sudo -E apt-get $APT_OPTS -y update
+        # 依赖列表由 xuxin1955 大佬提供
         PKGS=$(curl -fsSL https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt | tr ' ' '\n' | grep -vE '^(gcc-multilib|g\+\+-multilib|libc6-dev-i386)$' | tr '\n' ' ')
         sudo -E apt-get $APT_OPTS -y install --no-install-recommends $PKGS
         sudo timedatectl set-timezone "${TZ}"
 
-    - name: Clone source code
+    - name: 克隆作者源码
       run: |
         git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" sy108
         echo "SY108_COMMIT=$(git -C sy108 rev-parse --short HEAD)" >> $GITHUB_ENV
 
-    - name: Patch build scripts for CI
+    - name: 给源码打补丁 (干掉 Docker 限制)
       working-directory: ./sy108
       run: |
+        # workspace_overlay.py 来自社区大佬的智慧，直接抹除跨架构模拟
         cat "$GITHUB_WORKSPACE/scripts/sy108/workspace_overlay.py" >> tools/lib/workspace.py
         sed -i 's|raise SystemExit("Linux archive checksum mismatch")|print(f"::warning::kernel archive sha256={digest}, manifest mismatch ignored")|' tools/build/kernel-source.py
         sed -i "s/'V=s'/'V=' + __import__('os').environ.get('V','0')/g" tools/build/firmware.py
 
-    - name: Map build paths
+    - name: 映射编译路径
       run: |
         mkdir -p "$SY108_OUT" "$SY108_DOWNLOADS"
         sudo ln -sfn "$GITHUB_WORKSPACE/sy108" /project
         sudo ln -sfn "$SY108_OUT" /output
         sudo ln -sfn "$SY108_DOWNLOADS" /downloads
 
-    - name: Update & Install feeds (bootstrap)
+    - name: 初始化 OpenWrt 与 Feeds
       working-directory: ./sy108
-      run: |
-        ./tools/python tools/bootstrap.py --skip-container
+      run: ./tools/python tools/bootstrap.py --skip-container
 
-    - name: Load custom DIY_SY108_SH
+    - name: 加载自定义脚本
       run: |
         [ -f "$DIY_SY108_SH" ] || exit 0
         chmod +x "$DIY_SY108_SH"
         cd "$SY108_OUT/openwrt-build"
         $GITHUB_WORKSPACE/$DIY_SY108_SH
 
-    - name: Compile the SY108 firmware
+    - name: 编译固件
       working-directory: ./sy108
       run: |
         if ! ./tools/python tools/build/firmware.py "$PROFILE" --jobs "$JOBS"; then
@@ -103,40 +102,40 @@ jobs:
         fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: Organize files
-      if: env.UPLOAD_FIRMWARE == 'true'
+    - name: 整理编译产物
       run: |
         cd "$SY108_OUT/images/$PROFILE"
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
+    - name: 上传编译产物 (Main 和 Recovery)
+      uses: actions/upload-artifact@v4
       with:
         name: SY108_firmware_${{ env.PROFILE }}
         path: ${{ env.FIRMWARE }}/*
 
+  # ================= 阶段 2：串行封装 U-Boot =================
   package_uboot:
     needs: build
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+    - name: 拉取当前仓库
+      uses: actions/checkout@v4
 
-    - name: Download main and recovery firmware
-      uses: actions/download-artifact@main
+    - name: 下载 Main 和 Recovery 的产物
+      uses: actions/download-artifact@v4
       with:
         pattern: SY108_firmware_*
         path: firmware_artifacts
 
-    - name: Clone U-Boot
+    - name: 克隆 U-Boot 源码
       run: git clone --depth 1 https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
 
-    - name: Compile naked U-Boot
+    - name: 编译基础 U-Boot
       working-directory: ./uboot-spl
       run: make LABEL=dev
 
-    - name: Package U-Boot with SML Envelope
+    - name: 封装 U-Boot (注入原厂 SML 签名)
       working-directory: ./uboot-spl
       run: |
         make offline LABEL=mainline \
@@ -146,42 +145,66 @@ jobs:
           RECOVERY_CAPSULE=${{ github.workspace }}/firmware_artifacts/SY108_firmware_recovery/boot.bin
         cat build/mainline/offline-report.json
 
-    - name: Upload U-Boot artifact
-      uses: actions/upload-artifact@main
+    - name: 上传 U-Boot 产物
+      uses: actions/upload-artifact@v4
       with:
         name: SY108_firmware_uboot
         path: uboot-spl/build/mainline/uboot.bin
 
+  # ================= 阶段 3：统一发布到 Release =================
   release:
     needs: [build, package_uboot]
     runs-on: ubuntu-latest
     steps:
-    - name: Download all firmware artifacts
-      uses: actions/download-artifact@main
+    - name: 下载所有产物
+      uses: actions/download-artifact@v4
       with:
         pattern: SY108_firmware_*
         path: firmware
 
-    - name: Prepare release
+    - name: 整理文件并生成带致谢的发布说明
       id: tag
       run: |
         TAG=$(date +"%Y.%m.%d-%H%M")
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
         echo "release_name=SY108 华为5G通讯壳 OpenWrt 固件 (UDX710) $TAG" >> $GITHUB_OUTPUT
         
-        # 把各个文件夹里的文件挪出来，展平
-        find firmware -mindepth 2 -type f -exec mv {} firmware/ \;
-        rm -rf firmware/SY108_firmware_*
+        # 把各个文件夹里的文件全部扒出来，加上前缀区分
+        for d in firmware/SY108_firmware_*/; do
+          p=$(basename "$d" | sed 's/SY108_firmware_//')
+          for f in "$d"*; do
+            mv "$f" "firmware/${p}-$(basename "$f")"
+          done
+          rmdir "$d" 2>/dev/null || true
+        done
         
         cd firmware
         sha256sum * > sha256sums.txt
-        echo "源码: $REPO_URL" > release.txt
-        echo "管理地址: 192.168.66.1" >> release.txt
-        echo "登录账号: root" >> release.txt
-        echo "密码: admin" >> release.txt
         
-    - name: Upload to release
-      uses: ncipollo/release-action@main
+        # 🌟 核心：构建带有引流和致谢的 Release 说明
+        cat << 'EOF' > release.txt
+        ## 🚀 SY108 (UDX710) 自动化固件构建
+        
+        **管理地址**: `192.168.66.1` | **账号**: `root` | **密码**: `admin`
+        
+        ### 📦 源码与模板致谢 (Credits)
+        本固件由自动化流水线构建，离不开开源社区的贡献：
+        *   **核心源码移植**: [@jason-liu-4980](https://github.com/jason-liu-4980)
+            *   [sy108-mainline](https://github.com/jason-liu-4980/sy108-mainline) (GPL-2.0)
+            *   [linux-udx710](https://github.com/jason-liu-4980/linux-udx710) (GPL-2.0)
+            *   [sy108-uboot-spl](https://github.com/jason-liu-4980/sy108-uboot-spl) (GPL-2.0)
+        *   **Actions 自动化模板**: [@xuxin1955](https://github.com/xuxin1955/Actions)
+        *   **底层硬件与提取工具**: [@TomKing062](https://github.com/TomKing062/spreadtrum_flash) & [@dann2333](https://github.com/dann2333/udx710-mifi-info)
+        
+        > ⚖️ **开源协议声明**：本固件包含基于 GPL-2.0-only 协议的软件。根据 GPL 协议要求，对应的完整源码可通过上方链接获取。
+        > 🤖 **AI 辅助声明**：本项目编译流与文档在 AI 模型 (DeepSeek, GPT, Gemini) 的协助下完成。
+        
+        ### 📥 刷机说明
+        请使用 `spd_dump` 工具进入 `FDL2>` 模式进行刷写。详细教程请参阅项目 [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)。
+        EOF
+
+    - name: 发布到 GitHub Release
+      uses: ncipollo/release-action@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
@@ -189,3 +212,6 @@ jobs:
         tag: ${{ steps.tag.outputs.release_tag }}
         bodyFile: firmware/release.txt
         artifacts: firmware/*
+        allowUpdates: true
+        draft: false
+        prerelease: false
