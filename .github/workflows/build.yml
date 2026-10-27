@@ -110,7 +110,6 @@ jobs:
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
 
-    # 👇 这里就是你要的“自动流界面下载地址”
     - name: 上传编译产物 (Action 页面底部下载)
       uses: actions/upload-artifact@v4
       with:
@@ -131,7 +130,6 @@ jobs:
         pattern: SY108_firmware_*
         path: firmware_artifacts
 
-    # 🎯 核心修复：完整克隆并强制拉取 oem 分支
     - name: 克隆 U-Boot 源码 (修复 oem 分支问题)
       run: |
         git clone https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
@@ -160,7 +158,7 @@ jobs:
         name: SY108_firmware_uboot
         path: uboot-spl/build/mainline/uboot.bin
 
-    # ================= 阶段 3：统一发布到 Release =================
+  # ================= 阶段 3：统一发布到 Release =================
   release:
     needs: [build, package_uboot]
     runs-on: ubuntu-latest
@@ -168,7 +166,7 @@ jobs:
     - name: 1. 拉取当前仓库源码 (获取 tool/SY108 里的全套工具)
       uses: actions/checkout@v4
 
-    - name: 2. 下载编译产物
+    - name: 2. 下载所有编译产物
       uses: actions/download-artifact@v4
       with:
         pattern: SY108_firmware_*
@@ -181,11 +179,18 @@ jobs:
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
         echo "release_name=SY108 华为5G通讯壳 OpenWrt 全自动刷机包 $TAG" >> $GITHUB_OUTPUT
         
-        # 1. 把散落的编译产物打平
-        find firmware -mindepth 2 -type f -exec mv {} firmware/ \;
-        rm -rf firmware/SY108_firmware_*
+        # 🎯 修复：使用 for 循环带前缀移动，防止同名文件互相覆盖
+        for d in firmware/SY108_firmware_*/; do
+          p=$(basename "$d" | sed 's/SY108_firmware_//')
+          for f in "$d"*; do
+            if [ -f "$f" ]; then
+              mv "$f" "firmware/${p}-$(basename "$f")"
+            fi
+          done
+          rmdir "$d" 2>/dev/null || true
+        done
         
-        # 2. 打包所有的原始编译结果 (包含各种 .config, .dtb, build.json 等)
+        # 2. 打包所有的原始编译结果 (现在文件名如 main-sysupgrade.bin, recovery-boot.bin)
         cd firmware
         zip -r "../原始编译结果_${TAG}.zip" .
         cd ..
@@ -195,7 +200,7 @@ jobs:
         cp firmware/recovery-boot.bin tool/SY108/recovery.bin
         cp firmware/uboot-uboot.bin tool/SY108/uboot.bin
         
-        # 4. 按照要求，剔除开发者专用的 README.md
+        # 4. 剔除开发者专用的 README.md
         rm -f tool/SY108/README.md
         
         # 5. 生成一份用户直接看的简易说明
