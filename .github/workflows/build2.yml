@@ -23,10 +23,8 @@ env:
   TZ: Asia/Shanghai
   SY108_OUT: ${{ github.workspace }}/out
   SY108_DOWNLOADS: ${{ github.workspace }}/dl
-  # U-Boot 裸二进制安全线 600 KiB（为 DHTB+SML 封装预留余量）
+  # U-Boot 裸二进制安全线 600 KiB（真正的体积门禁）
   UBOOT_RAW_LIMIT: 614400
-  # SPL 实际读取上限 0xC0000 = 768 KiB
-  UBOOT_PART_LIMIT: 786432
 
 jobs:
   # ================= 阶段 1：双线并行编译 =================
@@ -129,7 +127,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: 安装裁剪工具
-      run: sudo apt-get install -y binutils-aarch64-linux-gnu || true
+      run: sudo apt-get install -y binutils-aarch64-linux-gnu python3 || true
 
     - name: 检查原厂 SML/SPL 是否就位
       run: |
@@ -154,57 +152,79 @@ jobs:
         git fetch --all --tags
         git branch oem origin/oem || echo "本地 oem 分支已就绪"
 
-    - name: 注入源码级裁剪配置 + USB 控制台
+    - name: 注入源码级裁剪配置（缩小 U-Boot 体积 + 开启 USB 控制台）
       working-directory: ./uboot-spl
       run: |
         set -e
-        DEFCONFIG=$(find . -maxdepth 5 -name '*defconfig' -path '*configs*' | head -1 || true)
-        if [ -z "$DEFCONFIG" ]; then
-          echo "::warning::未找到 defconfig，跳过源码裁剪注入。请手动配置 CONFIG_NET/USB_TTY 等。"
-          exit 0
+        UBOOT_SRC="src/u-boot"
+        if [ ! -d "$UBOOT_SRC/configs" ]; then
+          echo "::error::未找到 $UBOOT_SRC/configs，请检查仓库结构"
+          exit 1
         fi
-        echo "找到 defconfig: $DEFCONFIG"
-        cat >> "$DEFCONFIG" <<'UBOOT_TRIM'
 
-        # ===== 体积裁剪：关闭未使用功能 =====
-        # CONFIG_NET is not set
-        # CONFIG_CMD_NET is not set
-        # CONFIG_CMD_PING is not set
-        # CONFIG_CMD_DHCP is not set
-        # CONFIG_CMD_TFTPBOOT is not set
-        # CONFIG_CMD_NFS is not set
-        # CONFIG_CMD_FAT is not set
-        # CONFIG_CMD_EXT4 is not set
-        # CONFIG_CMD_EXT2 is not set
-        # CONFIG_FS_FAT is not set
-        # CONFIG_FS_EXT4 is not set
-        # CONFIG_USB_HOST is not set
-        # CONFIG_USB_EHCI_HCD is not set
-        # CONFIG_USB_XHCI_HCD is not set
-        # CONFIG_USB_STORAGE is not set
-        # CONFIG_CMD_MEMTEST is not set
-        # CONFIG_CMD_BDI is not set
-        # CONFIG_CMD_IRQ is not set
-        # CONFIG_CMD_DATE is not set
-        # CONFIG_CMD_SLEEP is not set
-        # CONFIG_DEBUG is not set
-        # CONFIG_LOG is not set
+        DEFCONFIGS=$(find "$UBOOT_SRC/configs" -name '*defconfig' -type f)
+        if [ -z "$DEFCONFIGS" ]; then
+          echo "::error::未找到任何 defconfig"
+          exit 1
+        fi
 
-        # ===== USB 控制台（唯一交互通道）=====
-        CONFIG_USB=y
-        CONFIG_USB_DEVICE=y
-        CONFIG_USB_GADGET=y
-        CONFIG_USB_TTY=y
-        CONFIG_USB_GADGET_DWC3=y
-        CONFIG_CMD_USB=y
+        echo "将向以下 defconfig 注入裁剪配置："
+        echo "$DEFCONFIGS"
 
-        # ===== 体积优化 =====
-        CONFIG_LTO=y
-        UBOOT_TRIM
-        # 确保下次 make 从 defconfig 重新生成 .config
-        find . -maxdepth 5 -name '.config' -path '*u-boot*' -delete 2>/dev/null || true
+        for defconfig in $DEFCONFIGS; do
+          echo "=== 处理 $defconfig ==="
+          cat >> "$defconfig" <<'UBOOT_TRIM'
 
-    - name: 编译 U-Boot 并执行裸二进制大小门禁
+# ===== SY108 体积裁剪：关闭未使用功能 =====
+# --- 网络协议栈（通常 150–250 KB 收益）---
+# CONFIG_NET is not set
+# CONFIG_CMD_NET is not set
+# CONFIG_CMD_PING is not set
+# CONFIG_CMD_DHCP is not set
+# CONFIG_CMD_TFTPBOOT is not set
+# CONFIG_CMD_NFS is not set
+# --- 文件系统浏览命令（引导流程只从固定偏移加载 UBI，不需要浏览分区）---
+# CONFIG_CMD_FAT is not set
+# CONFIG_CMD_EXT4 is not set
+# CONFIG_CMD_EXT2 is not set
+# CONFIG_FS_FAT is not set
+# CONFIG_FS_EXT4 is not set
+# --- USB Host 侧（保留 Device 侧给 usbtty 控制台）---
+# CONFIG_USB_HOST is not set
+# CONFIG_USB_EHCI_HCD is not set
+# CONFIG_USB_XHCI_HCD is not set
+# CONFIG_USB_STORAGE is not set
+# --- 调试与非必需命令 ---
+# CONFIG_CMD_MEMTEST is not set
+# CONFIG_CMD_BDI is not set
+# CONFIG_CMD_IRQ is not set
+# CONFIG_CMD_DATE is not set
+# CONFIG_CMD_SLEEP is not set
+# CONFIG_DEBUG is not set
+# CONFIG_LOG is not set
+
+# ===== USB 控制台（本机仅引出 USB，唯一交互通道）=====
+CONFIG_USB=y
+CONFIG_USB_DEVICE=y
+CONFIG_USB_GADGET=y
+CONFIG_USB_TTY=y
+CONFIG_CMD_USB=y
+# 注意：DWC3 gadget 的 Kconfig 符号名在不同 U-Boot 版本可能为
+# CONFIG_USB_GADGET_DWC3=y 或 CONFIG_USB_DWC3_GADGET=y。
+# 若下面一行导致 Kconfig 警告，请根据实际版本改为正确的符号名。
+CONFIG_USB_GADGET_DWC3=y
+
+# ===== 链接时优化，进一步缩减体积 =====
+CONFIG_LTO=y
+UBOOT_TRIM
+        done
+
+        # 删除可能存在的旧 .config，强制从 defconfig 重新生成
+        find "$UBOOT_SRC" -maxdepth 2 -name '.config' -delete 2>/dev/null || true
+
+        echo "✅ 裁剪配置注入完成"
+
+    - name: 编译 U-Boot 并报告裸二进制大小
       working-directory: ./uboot-spl
       run: |
         set -e
@@ -213,7 +233,6 @@ jobs:
         echo "================= 编译产物清单 ================="
         find . -type f -name "u-boot*" -exec ls -lh {} \; || true
 
-        # 取最终引导用的裸二进制：优先 u-boot-dtb.bin，其次 u-boot.bin
         UBIN=$(find . -type f -name "u-boot-dtb.bin" | head -1 || true)
         if [ -z "$UBIN" ]; then
           UBIN=$(find . -type f -name "u-boot.bin" | head -1 || true)
@@ -225,7 +244,6 @@ jobs:
         SIZE=$(stat -c%s "$UBIN")
         echo "U-Boot 裸二进制: $UBIN = ${SIZE} bytes (安全线 ${UBOOT_RAW_LIMIT})"
 
-        # 检查关键配置是否真正生效
         CONFIG_FILE=$(find . -maxdepth 5 -name '.config' -path '*u-boot*' | head -1 || true)
         if [ -n "$CONFIG_FILE" ]; then
           echo "================= 关键配置检查 ================="
@@ -235,14 +253,7 @@ jobs:
           fi
         fi
 
-        if [ "$SIZE" -gt "$UBOOT_RAW_LIMIT" ]; then
-          echo "::error::U-Boot ${SIZE} bytes 超过安全线 ${UBOOT_RAW_LIMIT} bytes。"
-          echo "请继续裁剪 defconfig：关闭更多 CMD_* 和驱动。"
-          exit 1
-        fi
-        echo "✅ U-Boot 裸二进制在安全范围内 (${SIZE} < ${UBOOT_RAW_LIMIT})"
-
-    - name: 封装 U-Boot (注入原厂 SML 签名) 并检查分区上限
+    - name: 封装 U-Boot (注入原厂 SML 签名) 并校验 SPL 有效载荷
       working-directory: ./uboot-spl
       run: |
         set -e
@@ -251,15 +262,43 @@ jobs:
           SML_IMAGE=${{ github.workspace }}/privates/sml.bin \
           MAIN_CAPSULE=${{ github.workspace }}/firmware_artifacts/SY108_firmware_main/boot.bin \
           RECOVERY_CAPSULE=${{ github.workspace }}/firmware_artifacts/SY108_firmware_recovery/boot.bin
-        cat build/mainline/offline-report.json
 
-        FINAL_SIZE=$(stat -c%s build/mainline/uboot.bin)
-        echo "最终 uboot.bin: ${FINAL_SIZE} bytes (SPL 读取上限 ${UBOOT_PART_LIMIT})"
-        if [ "$FINAL_SIZE" -gt "$UBOOT_PART_LIMIT" ]; then
-          echo "::error::封装后 uboot.bin 超过 SPL 读取上限！"
+        REPORT="build/mainline/offline-report.json"
+        echo "================= offline-report.json ================="
+        cat "$REPORT"
+
+        # 从报告中提取 SPL 真正关心的字段
+        RAW_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['ELF']['raw_bytes'])")
+        NEW_UBOOT_DTB_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['new_uboot_dtb_bytes'])")
+        REQUIRED_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['required_bytes'])")
+        SPL_READ_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['spl_read_bytes'])")
+
+        echo "================= 体积报告 ================="
+        echo "U-Boot 裸二进制 (ELF.raw_bytes):          ${RAW_BYTES} bytes"
+        echo "U-Boot + DTB  (new_uboot_dtb_bytes):     ${NEW_UBOOT_DTB_BYTES} bytes"
+        echo "SPL 有效载荷  (required_bytes):           ${REQUIRED_BYTES} bytes"
+        echo "SPL 读取上限  (spl_read_bytes):           ${SPL_READ_BYTES} bytes"
+        echo "裸二进制安全线:                            ${UBOOT_RAW_LIMIT} bytes"
+
+        # ---- 门禁 1：U-Boot 裸二进制必须小于 600 KiB ----
+        # 这是真正的体积约束，裁剪是否到位看这里。
+        if [ "$RAW_BYTES" -gt "$UBOOT_RAW_LIMIT" ]; then
+          echo "::error::U-Boot 裸二进制 ${RAW_BYTES} bytes 超过安全线 ${UBOOT_RAW_LIMIT} bytes。请继续裁剪 defconfig。"
           exit 1
         fi
-        echo "✅ 封装后 uboot.bin 在 SPL 读取上限内"
+
+        # ---- 门禁 2：SPL 有效载荷必须在 SPL 读取范围内 ----
+        # 这才是 SPL 层面是否越界的真实判断。不要用 uboot.bin 的文件大小
+        # （它被填充到分区大小 1310720），而要用 required_bytes。
+        if [ "$REQUIRED_BYTES" -gt "$SPL_READ_BYTES" ]; then
+          echo "::error::SPL 有效载荷 ${REQUIRED_BYTES} bytes 超过 SPL 读取上限 ${SPL_READ_BYTES} bytes。"
+          exit 1
+        fi
+
+        SPARE=$((SPL_READ_BYTES - REQUIRED_BYTES))
+        echo "✅ 体积校验通过："
+        echo "   U-Boot 裸二进制 ${RAW_BYTES} < ${UBOOT_RAW_LIMIT}（安全线）"
+        echo "   SPL 有效载荷   ${REQUIRED_BYTES} < ${SPL_READ_BYTES}（SPL 读取上限），余量 ${SPARE} bytes"
 
     - name: 上传 U-Boot 产物 (Action 页面底部下载)
       uses: actions/upload-artifact@v4
@@ -348,7 +387,6 @@ jobs:
         cd ../..
 
         # 7. 生成 GitHub Release 页面展示的说明文档
-        #    注意：这里用 << EOF（不加引号），让 ${DATE_TAG} 正常展开
         cat << EOF > release.txt
         ## 🚀 SY108 (UDX710) 自动化构建发布
 
