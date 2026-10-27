@@ -116,13 +116,16 @@ jobs:
         name: SY108_firmware_${{ env.PROFILE }}
         path: ${{ env.FIRMWARE }}/*
 
-  # ================= 阶段 2：串行封装 U-Boot =================
+  # ================= 阶段 2：串行封装 U-Boot (含瘦身) =================
   package_uboot:
     needs: build
     runs-on: ubuntu-latest
     steps:
     - name: 拉取当前仓库
       uses: actions/checkout@v4
+
+    - name: 安装裁剪工具 (如果环境里没有)
+      run: sudo apt-get install -y binutils-aarch64-linux-gnu || true
 
     - name: 下载 Main 和 Recovery 的产物
       uses: actions/download-artifact@v4
@@ -136,11 +139,24 @@ jobs:
         cd uboot-spl
         git fetch --all --tags
         git branch oem origin/oem || echo "本地 oem 分支已就绪"
-        git branch -a
 
-    - name: 编译基础 U-Boot
+    - name: 编译基础 U-Boot 并强力瘦身
       working-directory: ./uboot-spl
-      run: make LABEL=dev
+      run: |
+        make LABEL=dev
+        
+        echo "================= 裁剪前的文件大小 ================="
+        find . -type f -name "u-boot*" -exec ls -lh {} \;
+        
+        # 🎯 核心瘦身：剥离编译产生的调试符号，把多余体积砍掉
+        echo "================= 开始执行 strip 裁剪 ================="
+        find . -type f -name "u-boot" -exec aarch64-linux-gnu-strip {} \; 2>/dev/null || true
+        find . -type f -name "u-boot.bin" -exec aarch64-linux-gnu-strip {} \; 2>/dev/null || true
+        find . -type f -name "u-boot-dtb.bin" -exec aarch64-linux-gnu-strip {} \; 2>/dev/null || true
+        find . -type f -name "u-boot-nodtb.bin" -exec aarch64-linux-gnu-strip {} \; 2>/dev/null || true
+        
+        echo "================= 裁剪后的文件大小 ================="
+        find . -type f -name "u-boot*" -exec ls -lh {} \;
 
     - name: 封装 U-Boot (注入原厂 SML 签名)
       working-directory: ./uboot-spl
@@ -172,14 +188,15 @@ jobs:
         pattern: SY108_firmware_*
         path: firmware
 
-    - name: 3. 组装终极一键刷机包 & 打包原始结果
+    - name: 3. 组装一键刷机包与原始备份包
       id: tag
       run: |
         TAG=$(date +"%Y.%m.%d-%H%M")
+        DATE_TAG=$(date +"%Y%m%d")
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
-        echo "release_name=SY108 华为5G通讯壳 OpenWrt 全自动刷机包 $TAG" >> $GITHUB_OUTPUT
+        echo "release_name=SY108 OpenWrt 全自动刷机包 $TAG" >> $GITHUB_OUTPUT
         
-        # 🎯 修复：使用 for 循环带前缀移动，防止同名文件互相覆盖
+        # 1. 把散落的编译产物打平并加上前缀，防止同名覆盖
         for d in firmware/SY108_firmware_*/; do
           p=$(basename "$d" | sed 's/SY108_firmware_//')
           for f in "$d"*; do
@@ -190,14 +207,14 @@ jobs:
           rmdir "$d" 2>/dev/null || true
         done
         
-        # 2. 打包所有的原始编译结果 (现在文件名如 main-sysupgrade.bin, recovery-boot.bin)
+        # 2. 打包所有的原始编译结果，命名为 bak-日期.zip
         cd firmware
-        zip -r "../原始编译结果_${TAG}.zip" .
+        zip -r "../bak-${DATE_TAG}.zip" .
         cd ..
         
-        # 3. 将核心固件复制到工具目录，并统一命名以便 install.bat 识别
-        cp firmware/main-sysupgrade.bin tool/SY108/sysupgrade.bin
-        cp firmware/recovery-boot.bin tool/SY108/recovery.bin
+        # 3. 将核心固件复制到工具目录，并统一重命名
+        cp firmware/main-sysupgrade.bin tool/SY108/system.bin
+        cp firmware/main-boot.bin tool/SY108/boot.bin
         cp firmware/uboot-uboot.bin tool/SY108/uboot.bin
         
         # 4. 剔除开发者专用的 README.md
@@ -218,9 +235,9 @@ jobs:
         ====================================================
         EOF
         
-        # 6. 进入 tool/SY108 目录内部进行打包，避免解压后产生多层文件夹嵌套
+        # 6. 进入 tool/SY108 目录内部打包为 SY108.zip
         cd tool/SY108
-        zip -r "../../SY108_全自动刷机包_${TAG}.zip" .
+        zip -r "../../SY108.zip" .
         cd ../..
         
         # 7. 生成 GitHub Release 页面展示的说明文档
@@ -228,8 +245,8 @@ jobs:
         ## 🚀 SY108 (UDX710) 自动化构建发布
         
         本次发布包含两个压缩包：
-        1. **`SY108_全自动刷机包_*.zip`**：普通用户直接下载这个，解压后双击 `install.bat` 即可一键刷机。
-        2. **`原始编译结果_*.zip`**：包含本次编译的所有原始产物（`.dtb`、`.config`、`.json` 等），供开发者或进阶调试使用。
+        1. **`SY108.zip`**：全自动一键刷机包。解压后双击 `install.bat` 即可刷机。
+        2. **`bak-${DATE_TAG}.zip`**：包含本次编译的所有原始产物，供开发者使用。
         
         ### 📥 刷机说明
         *(如遇到驱动问题，请阅读刷机包内的 `刷机必读.txt`)*
@@ -252,8 +269,8 @@ jobs:
         tag: ${{ steps.tag.outputs.release_tag }}
         bodyFile: release.txt
         artifacts: |
-          SY108_全自动刷机包_*.zip
-          原始编译结果_*.zip
+          SY108.zip
+          bak-*.zip
           release.txt
         allowUpdates: true
         draft: false
