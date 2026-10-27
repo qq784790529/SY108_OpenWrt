@@ -160,65 +160,96 @@ jobs:
         name: SY108_firmware_uboot
         path: uboot-spl/build/mainline/uboot.bin
 
-  # ================= 阶段 3：统一发布到 Release =================
+    # ================= 阶段 3：统一发布到 Release =================
   release:
     needs: [build, package_uboot]
     runs-on: ubuntu-latest
     steps:
-    - name: 下载所有产物
+    - name: 1. 拉取当前仓库源码 (获取 tool/SY108 里的全套工具)
+      uses: actions/checkout@v4
+
+    - name: 2. 下载编译产物
       uses: actions/download-artifact@v4
       with:
         pattern: SY108_firmware_*
         path: firmware
 
-    - name: 整理文件并生成带致谢的发布说明
+    - name: 3. 组装终极一键刷机包 & 打包原始结果
       id: tag
       run: |
         TAG=$(date +"%Y.%m.%d-%H%M")
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
-        echo "release_name=SY108 华为5G通讯壳 OpenWrt 固件 (UDX710) $TAG" >> $GITHUB_OUTPUT
+        echo "release_name=SY108 华为5G通讯壳 OpenWrt 全自动刷机包 $TAG" >> $GITHUB_OUTPUT
         
-        for d in firmware/SY108_firmware_*/; do
-          p=$(basename "$d" | sed 's/SY108_firmware_//')
-          for f in "$d"*; do
-            mv "$f" "firmware/${p}-$(basename "$f")"
-          done
-          rmdir "$d" 2>/dev/null || true
-        done
+        # 1. 把散落的编译产物打平
+        find firmware -mindepth 2 -type f -exec mv {} firmware/ \;
+        rm -rf firmware/SY108_firmware_*
         
+        # 2. 打包所有的原始编译结果 (包含各种 .config, .dtb, build.json 等)
         cd firmware
-        sha256sum * > sha256sums.txt
+        zip -r "../原始编译结果_${TAG}.zip" .
+        cd ..
         
+        # 3. 将核心固件复制到工具目录，并统一命名以便 install.bat 识别
+        cp firmware/main-sysupgrade.bin tool/SY108/sysupgrade.bin
+        cp firmware/recovery-boot.bin tool/SY108/recovery.bin
+        cp firmware/uboot-uboot.bin tool/SY108/uboot.bin
+        
+        # 4. 按照要求，剔除开发者专用的 README.md
+        rm -f tool/SY108/README.md
+        
+        # 5. 生成一份用户直接看的简易说明
+        cat << 'EOF' > tool/SY108/刷机必读.txt
+        ================ SY108 一键刷机说明 ================
+        1. 如果电脑没反应，请先安装 "SPRDriver" 文件夹里的驱动。
+        2. 如果 spd_dump 报错，请运行 "zadig-2.9.exe"，在 Options 勾选 List All Devices，
+           选中你的设备，将驱动替换为 libusb-win32。
+        3. 让设备进入刷机模式（按住 RESET 插线）。
+        4. 双击运行 install.bat，按提示输入 Y 即可。
+        
+        刷机完成后访问: http://192.168.66.1
+        账号: root
+        密码: admin
+        ====================================================
+        EOF
+        
+        # 6. 进入 tool/SY108 目录内部进行打包，避免解压后产生多层文件夹嵌套
+        cd tool/SY108
+        zip -r "../../SY108_全自动刷机包_${TAG}.zip" .
+        cd ../..
+        
+        # 7. 生成 GitHub Release 页面展示的说明文档
         cat << 'EOF' > release.txt
-        ## 🚀 SY108 (UDX710) 自动化固件构建
+        ## 🚀 SY108 (UDX710) 自动化构建发布
         
-        **管理地址**: `192.168.66.1` | **账号**: `root` | **密码**: `admin`
-        
-        ### 📦 源码与模板致谢 (Credits)
-        本固件由自动化流水线构建，离不开开源社区的贡献：
-        *   **核心源码移植**: [@jason-liu-4980](https://github.com/jason-liu-4980)
-            *   [sy108-mainline](https://github.com/jason-liu-4980/sy108-mainline) (GPL-2.0)
-            *   [linux-udx710](https://github.com/jason-liu-4980/linux-udx710) (GPL-2.0)
-            *   [sy108-uboot-spl](https://github.com/jason-liu-4980/sy108-uboot-spl) (GPL-2.0)
-        *   **Actions 自动化模板**: [@xuxin1955](https://github.com/xuxin1955/Actions)
-        *   **底层硬件与提取工具**: [@TomKing062](https://github.com/TomKing062/spreadtrum_flash) & [@dann2333](https://github.com/dann2333/udx710-mifi-info)
-        
-        > ⚖️ **开源协议声明**：本固件包含基于 GPL-2.0-only 协议的软件。根据 GPL 协议要求，对应的完整源码可通过上方链接获取。
-        > 🤖 **AI 辅助声明**：本项目编译流与文档在 AI 模型 (DeepSeek, GPT, Gemini) 的协助下完成。
+        本次发布包含两个压缩包：
+        1. **`SY108_全自动刷机包_*.zip`**：普通用户直接下载这个，解压后双击 `install.bat` 即可一键刷机。
+        2. **`原始编译结果_*.zip`**：包含本次编译的所有原始产物（`.dtb`、`.config`、`.json` 等），供开发者或进阶调试使用。
         
         ### 📥 刷机说明
-        请使用 `spd_dump` 工具进入 `FDL2>` 模式进行刷写。详细教程请参阅项目 [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)。
+        *(如遇到驱动问题，请阅读刷机包内的 `刷机必读.txt`)*
+        **管理地址**: `192.168.66.1` | **账号**: `root` | **密码**: `admin`
+        
+        ### 🙏 源码与致谢
+        *   核心源码移植: [@jason-liu-4980](https://github.com/jason-liu-4980)
+        *   Actions 自动化模板: [@xuxin1955](https://github.com/xuxin1955/Actions)
+        *   底层硬件与提取工具: [@TomKing062](https://github.com/TomKing062/spreadtrum_flash) & [@dann2333](https://github.com/dann2333/udx710-mifi-info)
+        
+        > ⚖️ 本固件包含基于 GPL-2.0 协议的软件，源码见上方链接。
         EOF
 
-    - name: 发布到 GitHub Release
+    - name: 4. 发布到 GitHub Release
       uses: ncipollo/release-action@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         name: ${{ steps.tag.outputs.release_name }}
         tag: ${{ steps.tag.outputs.release_tag }}
-        bodyFile: firmware/release.txt
-        artifacts: firmware/*
+        bodyFile: release.txt
+        artifacts: |
+          SY108_全自动刷机包_*.zip
+          原始编译结果_*.zip
+          release.txt
         allowUpdates: true
         draft: false
         prerelease: false
