@@ -131,8 +131,14 @@ jobs:
         pattern: SY108_firmware_*
         path: firmware_artifacts
 
-    - name: 克隆 U-Boot 源码
-      run: git clone https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
+    # 🎯 核心修复：完整克隆并强制拉取 oem 分支
+    - name: 克隆 U-Boot 源码 (修复 oem 分支问题)
+      run: |
+        git clone https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
+        cd uboot-spl
+        git fetch --all --tags
+        git branch oem origin/oem || echo "本地 oem 分支已就绪"
+        git branch -a
 
     - name: 编译基础 U-Boot
       working-directory: ./uboot-spl
