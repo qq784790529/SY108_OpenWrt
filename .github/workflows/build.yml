@@ -132,7 +132,7 @@ jobs:
         path: firmware_artifacts
 
     - name: 克隆 U-Boot 源码
-      run: git clone --depth 1 https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
+      run: git clone https://github.com/jason-liu-4980/sy108-uboot-spl.git uboot-spl
 
     - name: 编译基础 U-Boot
       working-directory: ./uboot-spl
