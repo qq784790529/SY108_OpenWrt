@@ -12,8 +12,11 @@
 > **许可证说明**：上述仓库均基于 `GPL-2.0-only` 协议开源。
 
 ### 自动化构建与 CI/CD 模板
+本项目的 GitHub Actions 自动化流程（YAML 工作流）、多阶段并行构建思路以及配套脚本，极大程度上参考并得益于以下开源项目：
+
+*   **[@xuxin1955/Actions](https://github.com/xuxin1955/Actions)**：**本项目自动化流模板和核心脚本的直接来源。** 该仓库提供了非常完善、优雅的 OpenWrt 云端编译与发布工作流，极大降低了编译门槛。
 *   **[xuxin1955/depend_ubuntu2204_openwrt](https://github.com/xuxin1955/depend_ubuntu2204_openwrt)**：提供了 Ubuntu 环境下快速安装 OpenWrt 编译依赖的脚本。
-*   **[@P3TERX](https://github.com/P3TERX)**：本项目参考了其开源社区中广泛使用的 Actions 缓存与多阶段发布（Release）工作流思路。
+*   **[@P3TERX](https://github.com/P3TERX)**：本项目参考了其开源社区中广泛使用的 Actions 缓存机制与 Release 自动发布思路。
 *   **action-debugger**：提供了便捷的 SSH 云端调试能力（由 `WarpBuilds` 提供）。
 
 ### 底层硬件与刷机工具
