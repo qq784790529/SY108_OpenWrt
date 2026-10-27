@@ -88,6 +88,17 @@
 
 ---
 
+## ⚖️ 开源协议与分发声明
+
+本项目的自动化脚本采用 [MIT License](LICENSE) 开源。
+
+**⚠️ 固件分发注意**：本流水线编译生成的固件包含了来自 `jason-liu-4980` 及其贡献者的开源代码。这些核心源码基于 **GPL-2.0-only** 协议。根据 GPL 协议要求，若您分发本项目的编译产物，您必须提供对应的完整源码或获取源码的途径。
+
+对应源码仓库：
+- [sy108-mainline](https://github.com/jason-liu-4980/sy108-mainline)
+- [linux-udx710](https://github.com/jason-liu-4980/linux-udx710)
+- [sy108-uboot-spl](https://github.com/jason-liu-4980/sy108-uboot-spl)
+
 ## ⚠️ 免责声明
 
 **刷机有风险，操作需谨慎！**
