@@ -10,6 +10,10 @@ on:
         default: false
         type: boolean
 
+# 👇 核心修复：赋予 GITHUB_TOKEN 写入权限，解决 403 报错
+permissions:
+  contents: write
+
 env:
   REPO_URL: https://github.com/jason-liu-4980/sy108-mainline
   REPO_BRANCH: main
@@ -57,7 +61,6 @@ jobs:
       run: |
         APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::ForceIPv4=true"
         sudo -E apt-get $APT_OPTS -y update
-        # 依赖列表由 xuxin1955 大佬提供
         PKGS=$(curl -fsSL https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt | tr ' ' '\n' | grep -vE '^(gcc-multilib|g\+\+-multilib|libc6-dev-i386)$' | tr '\n' ' ')
         sudo -E apt-get $APT_OPTS -y install --no-install-recommends $PKGS
         sudo timedatectl set-timezone "${TZ}"
@@ -70,7 +73,6 @@ jobs:
     - name: 给源码打补丁 (干掉 Docker 限制)
       working-directory: ./sy108
       run: |
-        # workspace_overlay.py 来自社区大佬的智慧，直接抹除跨架构模拟
         cat "$GITHUB_WORKSPACE/scripts/sy108/workspace_overlay.py" >> tools/lib/workspace.py
         sed -i 's|raise SystemExit("Linux archive checksum mismatch")|print(f"::warning::kernel archive sha256={digest}, manifest mismatch ignored")|' tools/build/kernel-source.py
         sed -i "s/'V=s'/'V=' + __import__('os').environ.get('V','0')/g" tools/build/firmware.py
@@ -108,7 +110,8 @@ jobs:
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
 
-    - name: 上传编译产物 (Main 和 Recovery)
+    # 👇 这里就是你要的“自动流界面下载地址”
+    - name: 上传编译产物 (Action 页面底部下载)
       uses: actions/upload-artifact@v4
       with:
         name: SY108_firmware_${{ env.PROFILE }}
@@ -145,7 +148,7 @@ jobs:
           RECOVERY_CAPSULE=${{ github.workspace }}/firmware_artifacts/SY108_firmware_recovery/boot.bin
         cat build/mainline/offline-report.json
 
-    - name: 上传 U-Boot 产物
+    - name: 上传 U-Boot 产物 (Action 页面底部下载)
       uses: actions/upload-artifact@v4
       with:
         name: SY108_firmware_uboot
@@ -169,7 +172,6 @@ jobs:
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
         echo "release_name=SY108 华为5G通讯壳 OpenWrt 固件 (UDX710) $TAG" >> $GITHUB_OUTPUT
         
-        # 把各个文件夹里的文件全部扒出来，加上前缀区分
         for d in firmware/SY108_firmware_*/; do
           p=$(basename "$d" | sed 's/SY108_firmware_//')
           for f in "$d"*; do
@@ -181,7 +183,6 @@ jobs:
         cd firmware
         sha256sum * > sha256sums.txt
         
-        # 🌟 核心：构建带有引流和致谢的 Release 说明
         cat << 'EOF' > release.txt
         ## 🚀 SY108 (UDX710) 自动化固件构建
         
