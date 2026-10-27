@@ -174,49 +174,45 @@ jobs:
         for defconfig in $DEFCONFIGS; do
           echo "=== 处理 $defconfig ==="
           cat >> "$defconfig" <<'UBOOT_TRIM'
+        # ===== SY108 体积裁剪：关闭未使用功能 =====
+        # --- 网络协议栈（通常 150–250 KB 收益）---
+        # CONFIG_NET is not set
+        # CONFIG_CMD_NET is not set
+        # CONFIG_CMD_PING is not set
+        # CONFIG_CMD_DHCP is not set
+        # CONFIG_CMD_TFTPBOOT is not set
+        # CONFIG_CMD_NFS is not set
+        # --- 文件系统浏览命令（引导流程只从固定偏移加载 UBI，不需要浏览分区）---
+        # CONFIG_CMD_FAT is not set
+        # CONFIG_CMD_EXT4 is not set
+        # CONFIG_CMD_EXT2 is not set
+        # CONFIG_FS_FAT is not set
+        # CONFIG_FS_EXT4 is not set
+        # --- USB Host 侧（保留 Device 侧给 usbtty 控制台）---
+        # CONFIG_USB_HOST is not set
+        # CONFIG_USB_EHCI_HCD is not set
+        # CONFIG_USB_XHCI_HCD is not set
+        # CONFIG_USB_STORAGE is not set
+        # --- 调试与非必需命令 ---
+        # CONFIG_CMD_MEMTEST is not set
+        # CONFIG_CMD_BDI is not set
+        # CONFIG_CMD_IRQ is not set
+        # CONFIG_CMD_DATE is not set
+        # CONFIG_CMD_SLEEP is not set
+        # CONFIG_DEBUG is not set
+        # CONFIG_LOG is not set
 
-# ===== SY108 体积裁剪：关闭未使用功能 =====
-# --- 网络协议栈（通常 150–250 KB 收益）---
-# CONFIG_NET is not set
-# CONFIG_CMD_NET is not set
-# CONFIG_CMD_PING is not set
-# CONFIG_CMD_DHCP is not set
-# CONFIG_CMD_TFTPBOOT is not set
-# CONFIG_CMD_NFS is not set
-# --- 文件系统浏览命令（引导流程只从固定偏移加载 UBI，不需要浏览分区）---
-# CONFIG_CMD_FAT is not set
-# CONFIG_CMD_EXT4 is not set
-# CONFIG_CMD_EXT2 is not set
-# CONFIG_FS_FAT is not set
-# CONFIG_FS_EXT4 is not set
-# --- USB Host 侧（保留 Device 侧给 usbtty 控制台）---
-# CONFIG_USB_HOST is not set
-# CONFIG_USB_EHCI_HCD is not set
-# CONFIG_USB_XHCI_HCD is not set
-# CONFIG_USB_STORAGE is not set
-# --- 调试与非必需命令 ---
-# CONFIG_CMD_MEMTEST is not set
-# CONFIG_CMD_BDI is not set
-# CONFIG_CMD_IRQ is not set
-# CONFIG_CMD_DATE is not set
-# CONFIG_CMD_SLEEP is not set
-# CONFIG_DEBUG is not set
-# CONFIG_LOG is not set
+        # ===== USB 控制台（本机仅引出 USB，唯一交互通道）=====
+        CONFIG_USB=y
+        CONFIG_USB_DEVICE=y
+        CONFIG_USB_GADGET=y
+        CONFIG_USB_TTY=y
+        CONFIG_CMD_USB=y
+        CONFIG_USB_GADGET_DWC3=y
 
-# ===== USB 控制台（本机仅引出 USB，唯一交互通道）=====
-CONFIG_USB=y
-CONFIG_USB_DEVICE=y
-CONFIG_USB_GADGET=y
-CONFIG_USB_TTY=y
-CONFIG_CMD_USB=y
-# 注意：DWC3 gadget 的 Kconfig 符号名在不同 U-Boot 版本可能为
-# CONFIG_USB_GADGET_DWC3=y 或 CONFIG_USB_DWC3_GADGET=y。
-# 若下面一行导致 Kconfig 警告，请根据实际版本改为正确的符号名。
-CONFIG_USB_GADGET_DWC3=y
-
-# ===== 链接时优化，进一步缩减体积 =====
-CONFIG_LTO=y
-UBOOT_TRIM
+        # ===== 链接时优化，进一步缩减体积 =====
+        CONFIG_LTO=y
+        UBOOT_TRIM
         done
 
         # 删除可能存在的旧 .config，强制从 defconfig 重新生成
@@ -267,7 +263,6 @@ UBOOT_TRIM
         echo "================= offline-report.json ================="
         cat "$REPORT"
 
-        # 从报告中提取 SPL 真正关心的字段
         RAW_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['ELF']['raw_bytes'])")
         NEW_UBOOT_DTB_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['new_uboot_dtb_bytes'])")
         REQUIRED_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['required_bytes'])")
@@ -280,16 +275,11 @@ UBOOT_TRIM
         echo "SPL 读取上限  (spl_read_bytes):           ${SPL_READ_BYTES} bytes"
         echo "裸二进制安全线:                            ${UBOOT_RAW_LIMIT} bytes"
 
-        # ---- 门禁 1：U-Boot 裸二进制必须小于 600 KiB ----
-        # 这是真正的体积约束，裁剪是否到位看这里。
         if [ "$RAW_BYTES" -gt "$UBOOT_RAW_LIMIT" ]; then
           echo "::error::U-Boot 裸二进制 ${RAW_BYTES} bytes 超过安全线 ${UBOOT_RAW_LIMIT} bytes。请继续裁剪 defconfig。"
           exit 1
         fi
 
-        # ---- 门禁 2：SPL 有效载荷必须在 SPL 读取范围内 ----
-        # 这才是 SPL 层面是否越界的真实判断。不要用 uboot.bin 的文件大小
-        # （它被填充到分区大小 1310720），而要用 required_bytes。
         if [ "$REQUIRED_BYTES" -gt "$SPL_READ_BYTES" ]; then
           echo "::error::SPL 有效载荷 ${REQUIRED_BYTES} bytes 超过 SPL 读取上限 ${SPL_READ_BYTES} bytes。"
           exit 1
@@ -329,7 +319,6 @@ UBOOT_TRIM
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
         echo "release_name=SY108 OpenWrt 全自动刷机包 $TAG" >> $GITHUB_OUTPUT
 
-        # 1. 把散落的编译产物打平并加上前缀，防止同名覆盖
         for d in firmware/SY108_firmware_*/; do
           p=$(basename "$d" | sed 's/SY108_firmware_//')
           for f in "$d"*; do
@@ -340,20 +329,16 @@ UBOOT_TRIM
           rmdir "$d" 2>/dev/null || true
         done
 
-        # 2. 打包所有原始编译结果，命名为 bak-日期.zip
         cd firmware
         zip -r "../bak-${DATE_TAG}.zip" .
         cd ..
 
-        # 3. 将核心固件复制到工具目录，并统一重命名
         cp firmware/main-sysupgrade.bin tool/SY108/system.bin
         cp firmware/main-boot.bin      tool/SY108/boot.bin
         cp firmware/uboot-uboot.bin    tool/SY108/uboot.bin
 
-        # 4. 剔除开发者专用的 README.md
         rm -f tool/SY108/README.md
 
-        # 5. 生成用户刷机说明（含 USB 控制台）
         cat << 'EOF' > tool/SY108/刷机必读.txt
         ================ SY108 一键刷机说明 ================
         1. 如果电脑没反应，请先安装 "SPRDriver" 文件夹里的驱动。
@@ -381,12 +366,10 @@ UBOOT_TRIM
         ====================================================
         EOF
 
-        # 6. 进入 tool/SY108 目录内部打包为 SY108.zip
         cd tool/SY108
         zip -r "../../SY108.zip" .
         cd ../..
 
-        # 7. 生成 GitHub Release 页面展示的说明文档
         cat << EOF > release.txt
         ## 🚀 SY108 (UDX710) 自动化构建发布
 
