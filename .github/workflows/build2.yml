@@ -1,4 +1,4 @@
-name: Build_sy108_UDX710_2
+name: Build_sy108_UDX710
 
 on:
   repository_dispatch:
@@ -10,7 +10,6 @@ on:
         default: false
         type: boolean
 
-# 👇 赋予 GITHUB_TOKEN 写入权限，解决 Release 403
 permissions:
   contents: write
 
@@ -23,11 +22,9 @@ env:
   TZ: Asia/Shanghai
   SY108_OUT: ${{ github.workspace }}/out
   SY108_DOWNLOADS: ${{ github.workspace }}/dl
-  # U-Boot 裸二进制安全线 600 KiB（真正的体积门禁）
   UBOOT_RAW_LIMIT: 614400
 
 jobs:
-  # ================= 阶段 1：双线并行编译 =================
   build:
     strategy:
       fail-fast: false
@@ -118,7 +115,6 @@ jobs:
         name: SY108_firmware_${{ env.PROFILE }}
         path: ${{ env.FIRMWARE }}/*
 
-  # ================= 阶段 2：串行封装 U-Boot (源码级裁剪 + USB 控制台) =================
   package_uboot:
     needs: build
     runs-on: ubuntu-latest
@@ -174,6 +170,7 @@ jobs:
         for defconfig in $DEFCONFIGS; do
           echo "=== 处理 $defconfig ==="
           cat >> "$defconfig" <<'UBOOT_TRIM'
+
         # ===== SY108 体积裁剪：关闭未使用功能 =====
         # --- 网络协议栈（通常 150–250 KB 收益）---
         # CONFIG_NET is not set
@@ -182,7 +179,7 @@ jobs:
         # CONFIG_CMD_DHCP is not set
         # CONFIG_CMD_TFTPBOOT is not set
         # CONFIG_CMD_NFS is not set
-        # --- 文件系统浏览命令（引导流程只从固定偏移加载 UBI，不需要浏览分区）---
+        # --- 文件系统浏览命令 ---
         # CONFIG_CMD_FAT is not set
         # CONFIG_CMD_EXT4 is not set
         # CONFIG_CMD_EXT2 is not set
@@ -203,19 +200,18 @@ jobs:
         # CONFIG_LOG is not set
 
         # ===== USB 控制台（本机仅引出 USB，唯一交互通道）=====
-        CONFIG_USB=y
-        CONFIG_USB_DEVICE=y
+        # 注意：绝不能启用 CONFIG_USB (Host 模式)，否则会与展锐 DWC3 驱动冲突
+        # CONFIG_USB is not set
+        # CONFIG_CMD_USB is not set
         CONFIG_USB_GADGET=y
         CONFIG_USB_TTY=y
-        CONFIG_CMD_USB=y
-        CONFIG_USB_GADGET_DWC3=y
+        CONFIG_USB_DWC3_GADGET=y
 
         # ===== 链接时优化，进一步缩减体积 =====
         CONFIG_LTO=y
         UBOOT_TRIM
         done
 
-        # 删除可能存在的旧 .config，强制从 defconfig 重新生成
         find "$UBOOT_SRC" -maxdepth 2 -name '.config' -delete 2>/dev/null || true
 
         echo "✅ 裁剪配置注入完成"
@@ -243,7 +239,7 @@ jobs:
         CONFIG_FILE=$(find . -maxdepth 5 -name '.config' -path '*u-boot*' | head -1 || true)
         if [ -n "$CONFIG_FILE" ]; then
           echo "================= 关键配置检查 ================="
-          grep -E '^CONFIG_(NET|USB_TTY|USB_GADGET|USB_DEVICE|LTO)' "$CONFIG_FILE" || true
+          grep -E '^CONFIG_(NET|USB_TTY|USB_GADGET|USB_DWC3|LTO)' "$CONFIG_FILE" || true
           if ! grep -q '^CONFIG_USB_TTY=y' "$CONFIG_FILE"; then
             echo "::warning::CONFIG_USB_TTY 未生效，USB 控制台可能不可用"
           fi
@@ -296,7 +292,6 @@ jobs:
         name: SY108_firmware_uboot
         path: uboot-spl/build/mainline/uboot.bin
 
-  # ================= 阶段 3：统一发布到 Release =================
   release:
     needs: [build, package_uboot]
     runs-on: ubuntu-latest
