@@ -1,4 +1,4 @@
-name: Build_sy108_UDX710
+name: Build_sy108_UDX710_2
 
 on:
   repository_dispatch:
