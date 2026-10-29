@@ -245,7 +245,7 @@ jobs:
           fi
         fi
 
-    - name: 封装 U-Boot (注入原厂 SML 签名) 并校验 SPL 有效载荷
+    - name: 封装 U-Boot 并强制截断填充数据
       working-directory: ./uboot-spl
       run: |
         set -e
@@ -260,16 +260,13 @@ jobs:
         cat "$REPORT"
 
         RAW_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['ELF']['raw_bytes'])")
-        NEW_UBOOT_DTB_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['new_uboot_dtb_bytes'])")
         REQUIRED_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['required_bytes'])")
         SPL_READ_BYTES=$(python3 -c "import json;print(json.load(open('$REPORT'))['envelope']['spl_read_bytes'])")
 
         echo "================= 体积报告 ================="
         echo "U-Boot 裸二进制 (ELF.raw_bytes):          ${RAW_BYTES} bytes"
-        echo "U-Boot + DTB  (new_uboot_dtb_bytes):     ${NEW_UBOOT_DTB_BYTES} bytes"
         echo "SPL 有效载荷  (required_bytes):           ${REQUIRED_BYTES} bytes"
         echo "SPL 读取上限  (spl_read_bytes):           ${SPL_READ_BYTES} bytes"
-        echo "裸二进制安全线:                            ${UBOOT_RAW_LIMIT} bytes"
 
         if [ "$RAW_BYTES" -gt "$UBOOT_RAW_LIMIT" ]; then
           echo "::error::U-Boot 裸二进制 ${RAW_BYTES} bytes 超过安全线 ${UBOOT_RAW_LIMIT} bytes。请继续裁剪 defconfig。"
@@ -281,10 +278,18 @@ jobs:
           exit 1
         fi
 
-        SPARE=$((SPL_READ_BYTES - REQUIRED_BYTES))
+        # 【核心修改点】：计算 4KB 对齐的截断大小，并切除填充数据
+        ALIGNED_BYTES=$(( (REQUIRED_BYTES + 4095) / 4096 * 4096 ))
+        echo "截断对齐后大小:  ${ALIGNED_BYTES} bytes (约 $((ALIGNED_BYTES/1024)) KB)"
+
+        truncate -s $ALIGNED_BYTES build/mainline/uboot.bin
+
+        FINAL_SIZE=$(stat -c%s build/mainline/uboot.bin)
+        echo "✅ 截断完成！最终 uboot.bin 实际大小: ${FINAL_SIZE} bytes"
+
+        SPARE=$((SPL_READ_BYTES - FINAL_SIZE))
         echo "✅ 体积校验通过："
-        echo "   U-Boot 裸二进制 ${RAW_BYTES} < ${UBOOT_RAW_LIMIT}（安全线）"
-        echo "   SPL 有效载荷   ${REQUIRED_BYTES} < ${SPL_READ_BYTES}（SPL 读取上限），余量 ${SPARE} bytes"
+        echo "   SPL 有效载荷   ${FINAL_SIZE} < ${SPL_READ_BYTES}（SPL 读取上限），余量 ${SPARE} bytes"
 
     - name: 上传 U-Boot 产物 (Action 页面底部下载)
       uses: actions/upload-artifact@v4
